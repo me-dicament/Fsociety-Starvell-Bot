@@ -3,7 +3,7 @@ import sys
 
 sys.path.append(os.path.dirname(__file__))
 
-from tg_bot_exfa.bot import main
+from medic_bot.bot import main
 
 
 if __name__ == "__main__":
