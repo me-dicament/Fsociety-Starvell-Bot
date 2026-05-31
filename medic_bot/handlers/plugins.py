@@ -290,3 +290,25 @@ async def plugin_remove(callback: CallbackQuery, state: FSMContext):
 	await list_plugins(callback, state)
 
 
+@router.callback_query(F.data == "plugins:store")
+async def open_plugin_store(callback: CallbackQuery, state: FSMContext):
+	"""Открыть магазин плагинов"""
+	cfg = app.app_context.config
+	user = await app.app_context.db.get_user(callback.from_user.id)
+	lang = user.get("language") or cfg.default_language
+	await callback.answer()
+	# Имитируем команду /plugin_store
+	from medic_bot.handlers.plugin_store import cmd_plugin_store
+	# Создаём фиктивное сообщение
+	class FakeMessage:
+		def __init__(self, user_id, chat_id, bot, text):
+			self.from_user = type('obj', (object,), {'id': user_id})()
+			self.chat = type('obj', (object,), {'id': chat_id})()
+			self.bot = bot
+			self.text = text
+		async def answer(self, *args, **kwargs):
+			await bot.send_message(chat_id, *args, **kwargs)
+	fake_msg = FakeMessage(callback.from_user.id, callback.message.chat.id, callback.message.bot, "/plugin_store")
+	await cmd_plugin_store(fake_msg)
+
+

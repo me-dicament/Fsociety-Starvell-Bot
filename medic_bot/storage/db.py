@@ -86,6 +86,18 @@ class Database:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS auto_restore (
+                    offer_id INTEGER PRIMARY KEY,
+                    game_id INTEGER DEFAULT 0,
+                    category_id INTEGER DEFAULT 0,
+                    price INTEGER DEFAULT 0,
+                    quantity INTEGER DEFAULT 1,
+                    created_at INTEGER DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS autodelivery_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     product TEXT NOT NULL,
@@ -391,5 +403,68 @@ class Database:
                 await db.execute("DELETE FROM autodelivery_items WHERE product=?", (product,))
                 await db.commit()
                 return to_del
+
+    # === Автовосстановление лотов ===
+
+    async def set_auto_restore(self, offer_id: int, game_id: int, category_id: int, price: int, quantity: int = 1) -> None:
+        """Включить автовосстановление для лота"""
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                created_at = int(time.time())
+                await db.execute(
+                    "INSERT INTO auto_restore(offer_id, game_id, category_id, price, quantity, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(offer_id) DO UPDATE SET "
+                    "game_id=excluded.game_id, category_id=excluded.category_id, "
+                    "price=excluded.price, quantity=excluded.quantity, created_at=excluded.created_at",
+                    (offer_id, game_id, category_id, price, quantity, created_at),
+                )
+                await db.commit()
+
+    async def remove_auto_restore(self, offer_id: int) -> bool:
+        """Выключить автовосстановление для лота"""
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                cur = await db.execute("DELETE FROM auto_restore WHERE offer_id=?", (offer_id,))
+                await db.commit()
+                return cur.rowcount > 0
+
+    async def get_auto_restore(self, offer_id: int) -> dict | None:
+        """Получить настройку автовосстановления для лота"""
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT * FROM auto_restore WHERE offer_id=?", (offer_id,))
+                row = await cur.fetchone()
+                await cur.close()
+                return dict(row) if row else None
+
+    async def list_auto_restore(self) -> list[dict]:
+        """Получить все настройки автовосстановления"""
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT * FROM auto_restore ORDER BY offer_id ASC")
+                rows = await cur.fetchall()
+                await cur.close()
+                return [dict(r) for r in rows]
+
+    async def is_auto_restore(self, offer_id: int) -> bool:
+        """Проверить, включено ли автовосстановление для лота"""
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                cur = await db.execute("SELECT 1 FROM auto_restore WHERE offer_id=?", (offer_id,))
+                row = await cur.fetchone()
+                await cur.close()
+                return row is not None
+
+    async def count_auto_restore(self) -> int:
+        """Количество лотов с автовосстановлением"""
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                cur = await db.execute("SELECT COUNT(*) FROM auto_restore")
+                row = await cur.fetchone()
+                await cur.close()
+                return int(row[0]) if row else 0
 
 

@@ -20,8 +20,9 @@ class Keyboards:
         b.button(text=t("btn_settings"), callback_data="menu:settings")
         b.button(text=t("btn_prefix"), callback_data="menu:prefix")
         b.button(text=t("btn_plugins"), callback_data="menu:plugins")
+        b.button(text=t("btn_auto_restore"), callback_data="menu:auto_restore")
         b.button(text=t("btn_stats"), callback_data="menu:stats")
-        b.adjust(2, 2, 2, 2, 2)
+        b.adjust(2, 2, 2, 2, 2, 1)
         return b
 
     def notifications(
@@ -195,8 +196,35 @@ class Keyboards:
         b = InlineKeyboardBuilder()
         b.button(text=t("btn_plugins_add"), callback_data="plugins:add")
         b.button(text=t("btn_plugins_list"), callback_data="plugins:list")
+        b.button(text=t("btn_plugins_store"), callback_data="plugins:store")
+        b.button(text=t("btn_back"), callback_data="back:main")
+        b.adjust(2, 1, 1)
+        return b
+
+    def auto_restore_menu(self, t) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_auto_restore_list"), callback_data="auto_restore:list")
+        b.button(text=t("btn_auto_restore_toggle"), callback_data="auto_restore:toggle")
         b.button(text=t("btn_back"), callback_data="back:main")
         b.adjust(2, 1)
+        return b
+
+    def auto_restore_list(self, t, items: list[tuple[str, str]]) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        for item_id, label in items:
+            b.button(text=label, callback_data=f"auto_restore:item:{item_id}")
+        b.button(text=t("btn_back"), callback_data="menu:auto_restore")
+        b.adjust(1)
+        return b
+
+    def auto_restore_item(self, t, item_id: str, enabled: bool) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        if enabled:
+            b.button(text=t("btn_auto_restore_disable"), callback_data=f"auto_restore:remove:{item_id}")
+        else:
+            b.button(text=t("btn_auto_restore_enable"), callback_data=f"auto_restore:add:{item_id}")
+        b.button(text=t("btn_back"), callback_data="auto_restore:list")
+        b.adjust(1, 1)
         return b
 
     def info_links(self, t, author_url: str | None, channel_url: str | None, chat_url: str | None) -> InlineKeyboardBuilder:

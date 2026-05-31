@@ -13,6 +13,7 @@ from medic_bot.handlers.start import router as start_router
 from medic_bot.handlers.callbacks import router as callbacks_router
 from medic_bot.handlers.plugins import router as plugins_router
 from medic_bot.handlers.plugin_cmds import router as plugin_cmds_router
+from medic_bot.handlers.plugin_store import router as plugin_store_router
 from medic_bot.monitor import start_monitor, load_config as load_osnova_config
 from api.auth import fetch_homepage_data
 from medic_bot.logger import setup_logging
@@ -145,6 +146,7 @@ async def run_bot() -> None:
     dp.include_router(callbacks_router)
     dp.include_router(plugins_router)
     dp.include_router(plugin_cmds_router)
+    dp.include_router(plugin_store_router)
     dp.include_router(logs_router)
     log.info("Routers loaded. Starting monitor task…")
     try:

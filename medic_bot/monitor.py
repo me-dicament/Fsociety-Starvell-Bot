@@ -13,9 +13,11 @@ from api.chats import fetch_chats
 from api.messages import fetch_chat_messages
 from api.orders import fetch_sells
 from api.send_message import send_chat_message
+from api.offers import create_offer, deactivate_offer
 from medic_bot.notify import send_order_notification
 from medic_bot.notify import send_auth_notification, send_bump_notification
 from medic_bot.notify import send_chat_notification, send_order_completed_notification
+from medic_bot.notify import send_auto_restore_notification, send_auto_deactivate_notification
 from medic_bot.notify import sync_digest_view
 import medic_bot.app as app
 import requests
@@ -922,10 +924,13 @@ async def _check_orders(session_cookie: str, db) -> None:
                 ad_tuple = None
                 codes: list[str] = []
                 qty = int(order.get("quantity") or 1)
+                autodelivery_empty = False
                 if name:
                     for _ in range(max(1, qty)):
                         code = await db.pop_autodelivery_item(name)
                         if not code:
+                            # Товар закончился — автодеактивация
+                            autodelivery_empty = True
                             break
                         codes.append(code)
                     if codes:
@@ -959,6 +964,43 @@ async def _check_orders(session_cookie: str, db) -> None:
                                     await send_chat_message(session_cookie, chat_id, payload_text)
                         except Exception:
                             pass
+                # === Автодеактивация лота при отсутствии товара ===
+                if autodelivery_empty and name:
+                    try:
+                        offer_deact = order.get("offerDetails") or {}
+                        offer_obj_deact = offer_deact.get("offer") or {}
+                        deact_offer_id = offer_obj_deact.get("id") or offer_deact.get("id")
+                        if isinstance(deact_offer_id, int):
+                            cfg_d = load_config()
+                            sess_c = cfg_d.get("SESSION_COOKIE", "")
+                            auth_d = await fetch_homepage_data(sess_c)
+                            sid_d = auth_d.get("sid", "")
+                            my_g_d = auth_d.get("my_games", None)
+                            result_d = await deactivate_offer(
+                                session_cookie=sess_c,
+                                offer_id=deact_offer_id,
+                                sid_cookie=sid_d,
+                                my_games_cookie=my_g_d,
+                            )
+                            if result_d.get("success"):
+                                logging.getLogger("medic.monitor").info(
+                                    f"auto_deactivate_success offer_id={deact_offer_id} order_id={order_id}"
+                                )
+                                await send_auto_deactivate_notification(
+                                    deact_offer_id, name, order_id, success=True
+                                )
+                            else:
+                                logging.getLogger("medic.monitor").warning(
+                                    f"auto_deactivate_failed offer_id={deact_offer_id} order_id={order_id} "
+                                    f"status={result_d.get('status')}"
+                                )
+                                await send_auto_deactivate_notification(
+                                    deact_offer_id, name, order_id, success=False
+                                )
+                    except Exception as exc:
+                        logging.getLogger("medic.monitor").warning(
+                            f"auto_deactivate_error order_id={order_id} error={exc}"
+                        )
                 await send_order_notification(order, ad_tuple)
             except Exception:
                 try:
@@ -1009,6 +1051,57 @@ async def _check_orders(session_cookie: str, db) -> None:
                 await db.set_order_status(order_id, status)
                 if status == "COMPLETED":
                     await send_order_completed_notification(order)
+                    # === Автовосстановление лота после продажи ===
+                    try:
+                        offer_details = order.get("offerDetails") or {}
+                        offer_obj = offer_details.get("offer") or {}
+                        offer_id = offer_obj.get("id") or offer_details.get("id")
+                        if isinstance(offer_id, int) and await db.is_auto_restore(offer_id):
+                            auto_cfg = await db.get_auto_restore(offer_id)
+                            if auto_cfg:
+                                logging.getLogger("medic.monitor").info(
+                                    f"auto_restore_triggered offer_id={offer_id} order_id={order_id}"
+                                )
+                                cfg_n = load_config()
+                                session_c = cfg_n.get("SESSION_COOKIE", "")
+                                # Получаем sid и my_games
+                                auth_data = await fetch_homepage_data(session_c)
+                                sid = auth_data.get("sid", "")
+                                my_g = auth_data.get("my_games", None)
+                                if not my_g:
+                                    uid = ((auth_data or {}).get("user") or {}).get("id")
+                                    if uid:
+                                        ld = await find_user_lots(session_c, sid, uid)
+                                        my_g = (ld or {}).get("my_games")
+                                result = await create_offer(
+                                    session_cookie=session_c,
+                                    game_id=int(auto_cfg.get("game_id", 0)),
+                                    category_id=int(auto_cfg.get("category_id", 0)),
+                                    price=int(auto_cfg.get("price", 0)),
+                                    quantity=int(auto_cfg.get("quantity", 1)),
+                                    sid_cookie=sid,
+                                    my_games_cookie=my_g,
+                                )
+                                if result.get("success"):
+                                    logging.getLogger("medic.monitor").info(
+                                        f"auto_restore_success offer_id={offer_id} order_id={order_id}"
+                                    )
+                                    await send_auto_restore_notification(
+                                        offer_id, order_id, result.get("json", {}), success=True
+                                    )
+                                else:
+                                    logging.getLogger("medic.monitor").warning(
+                                        f"auto_restore_failed offer_id={offer_id} order_id={order_id} "
+                                        f"status={result.get('status')}"
+                                    )
+                                    await send_auto_restore_notification(
+                                        offer_id, order_id, result.get("json", {}), success=False
+                                    )
+                    except Exception as exc:
+                        logging.getLogger("medic.monitor").warning(
+                            f"auto_restore_error offer_id={offer_id if 'offer_id' in dir() else '?'} "
+                            f"order_id={order_id} error={exc}"
+                        )
                     try:
                         user = order.get("user") or {}
                         buyer = user.get("username") or str(user.get("id") or "-")

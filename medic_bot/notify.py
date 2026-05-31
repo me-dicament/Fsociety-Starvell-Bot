@@ -197,8 +197,15 @@ async def send_bump_notification(lot: dict, success: bool) -> None:
             btn_text = tr.t(lang, "btn_open_link")
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, url=url)]]) if url else None
             break
+        import time as _time
+        bump_interval = 1800  # 30 минут между бампами
+        next_bump_ts = int(_time.time()) + bump_interval
+        next_bump_str = _time.strftime("%H:%M", _time.localtime(next_bump_ts))
         for chat_id, lang in recipients:
             text = _text_bump(title, success, lang)
+            # Добавляем инфу о следующем бампе
+            time_info = f"\n⏱ Следующий бамп: ~{next_bump_str}" if success else ""
+            text += time_info
             await bot.send_message(chat_id, text, reply_markup=markup)
     finally:
         await bot.session.close()
@@ -467,6 +474,61 @@ async def sync_digest_view(payload: dict) -> None:
                         pass
             except Exception:
                 continue
+    finally:
+        await bot.session.close()
+
+
+async def send_auto_restore_notification(offer_id: int, order_id: str, result_json: dict, success: bool) -> None:
+    """Уведомление об автовосстановлении лота"""
+    cfg = load_config()
+    if not cfg.token:
+        return
+    bot = Bot(token=cfg.token, default=DefaultBotProperties(parse_mode="HTML"))
+    try:
+        recipients = await _recipients_authorized()
+        if not recipients:
+            return
+        if success:
+            new_offer_id = None
+            try:
+                new_offer_id = (result_json or {}).get("offerId") or (result_json or {}).get("id")
+            except Exception:
+                pass
+            text = f"♻️ Лот <code>{offer_id}</code> восстановлен после продажи!"
+            if new_offer_id:
+                text += f"\nНовый ID лота: <code>{new_offer_id}</code>"
+                text += f"\n🔗 https://starvell.com/offers/{new_offer_id}"
+        else:
+            text = f"❌ Не удалось восстановить лот <code>{offer_id}</code> после продажи заказа <code>{order_id}</code>"
+        for chat_id_, _lang in recipients:
+            try:
+                await bot.send_message(chat_id_, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            except Exception:
+                pass
+    finally:
+        await bot.session.close()
+
+
+async def send_auto_deactivate_notification(offer_id: int, product_name: str, order_id: str, success: bool) -> None:
+    """Уведомление об автодеактивации лота из-за отсутствия товара"""
+    cfg = load_config()
+    if not cfg.token:
+        return
+    bot = Bot(token=cfg.token, default=DefaultBotProperties(parse_mode="HTML"))
+    try:
+        recipients = await _recipients_authorized()
+        if not recipients:
+            return
+        if success:
+            text = f"🔴 Лот <code>{offer_id}</code> деактивирован — товар \"<code>{html.escape(product_name)}</code>\" закончился в автовыдаче!"
+        else:
+            text = f"⚠️ Не удалось деактивировать лот <code>{offer_id}</code> — товар закончился, но API вернул ошибку"
+        text += f"\nЗаказ: <code>{order_id}</code>"
+        for chat_id_, _lang in recipients:
+            try:
+                await bot.send_message(chat_id_, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            except Exception:
+                pass
     finally:
         await bot.session.close()
 

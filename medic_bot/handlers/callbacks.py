@@ -20,6 +20,7 @@ from medic_bot.states.chat import ChatReply
 from medic_bot.states.templates import TemplatesFlow
 from medic_bot.states.orders import OrderRefund
 from medic_bot.states.autodelivery import AutodeliveryFlow
+from medic_bot.states.auto_restore import AutoRestoreFlow
 from medic_bot.monitor import load_config as load_osnova_config
 from medic_bot.config import save_config
 
@@ -2249,6 +2250,247 @@ async def handle_chat_reply_unsupported(message: Message, state: FSMContext):
     user = await db.get_user(message.from_user.id)
     lang = await _lang_of(user, cfg)
     await message.answer(tr.t(lang, "reply_prompt"))
+
+
+# === Автовосстановление лотов ===
+
+@router.callback_query(F.data == "menu:auto_restore")
+async def open_auto_restore(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(callback.from_user.id)
+    lang = await _lang_of(user, cfg)
+    try:
+        count = await db.count_auto_restore()
+        lines = [
+            tr.t(lang, "auto_restore_title"),
+            tr.t(lang, "auto_restore_desc"),
+            "",
+            tr.t(lang, "auto_restore_count", count=count),
+        ]
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+        )
+    except Exception as exc:
+        log.warning("auto_restore_menu_failed user_id=%s error=%s", callback.from_user.id, exc)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "auto_restore:list")
+async def auto_restore_list(callback: CallbackQuery, state: FSMContext):
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(callback.from_user.id)
+    lang = await _lang_of(user, cfg)
+    items = await db.list_auto_restore()
+    mapping: dict[str, str] = {}
+    buttons: list[tuple[str, str]] = []
+    for idx, ar in enumerate(items, start=1):
+        oid = ar.get("offer_id", 0)
+        price = ar.get("price", 0) or 0
+        label = f"Лот #{oid} · {price}₽"
+        item_id = str(oid)
+        mapping[item_id] = label
+        buttons.append((item_id, label))
+    await state.update_data(auto_restore_map=mapping)
+    text = tr.t(lang, "auto_restore_list_title") if items else tr.t(lang, "auto_restore_list_empty")
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=kb.auto_restore_list(lambda k: tr.t(lang, k), buttons).as_markup(),
+        )
+    except Exception as exc:
+        log.warning("auto_restore_list_failed user_id=%s error=%s", callback.from_user.id, exc)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "auto_restore:toggle")
+async def auto_restore_toggle_start(callback: CallbackQuery, state: FSMContext):
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(callback.from_user.id)
+    lang = await _lang_of(user, cfg)
+    await state.set_state(AutoRestoreFlow.waiting_offer_id)
+    await state.update_data(last_message_id=callback.message.message_id)
+    try:
+        await callback.message.edit_text(
+            tr.t(lang, "auto_restore_select_offer"),
+            reply_markup=kb.cancel_custom(lambda k: tr.t(lang, k), "auto_restore:cancel").as_markup(),
+        )
+    except Exception as exc:
+        log.warning("auto_restore_toggle_prompt_failed user_id=%s error=%s", callback.from_user.id, exc)
+    await callback.answer()
+
+
+@router.message(AutoRestoreFlow.waiting_offer_id, F.text)
+async def auto_restore_on_offer_id(message: Message, state: FSMContext):
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(message.from_user.id)
+    lang = await _lang_of(user, cfg)
+    raw = (message.text or "").strip()
+    try:
+        offer_id = int(raw)
+    except (ValueError, TypeError):
+        await message.answer(tr.t(lang, "auto_restore_select_offer"))
+        return
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id") or message.message_id
+    # Проверяем, включено ли уже
+    is_enabled = await db.is_auto_restore(offer_id)
+    if is_enabled:
+        await db.remove_auto_restore(offer_id)
+        await message.bot.edit_message_text(
+            tr.t(lang, "auto_restore_confirm_disable", offer_id=offer_id),
+            chat_id=message.chat.id,
+            message_id=last_message_id,
+            reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+        )
+    else:
+        # Пытаемся найти этот лот через API
+        try:
+            from medic_bot.monitor import load_config as load_osnova_config
+            session_cfg = load_osnova_config()
+            session_cookie = session_cfg.get("SESSION_COOKIE", "")
+            auth = await fetch_homepage_data(session_cookie)
+            if auth.get("authorized") and auth.get("user"):
+                uid = auth["user"].get("id")
+                sid = auth.get("sid", "")
+                lots_data = await find_user_lots(session_cookie, sid, uid)
+                lots = lots_data.get("lots") or []
+                found = None
+                for lot in lots:
+                    if lot.get("id") == offer_id:
+                        found = lot
+                        break
+                if found:
+                    # Получаем категории и game_id
+                    from api.offer_details import fetch_offer_detail
+                    detail = await fetch_offer_detail(session_cookie, offer_id, sid, my_games_cookie=lots_data.get("my_games"))
+                    page_props = (detail or {}).get("pageProps", {})
+                    offer_obj = page_props.get("offer") or {}
+                    game = offer_obj.get("game") or {}
+                    category = offer_obj.get("category") or {}
+                    game_id = game.get("id")
+                    category_id = category.get("id") or offer_obj.get("categoryId")
+                    price = found.get("price") or offer_obj.get("price") or 0
+                    if isinstance(price, str):
+                        try:
+                            price = int(price)
+                        except ValueError:
+                            try:
+                                price = int(float(price))
+                            except (ValueError, TypeError):
+                                price = 0
+                    if not isinstance(game_id, int) or not isinstance(category_id, int):
+                        await message.bot.edit_message_text(
+                            tr.t(lang, "auto_restore_offer_not_found", offer_id=offer_id),
+                            chat_id=message.chat.id,
+                            message_id=last_message_id,
+                            reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+                        )
+                    else:
+                        await db.set_auto_restore(offer_id, game_id, category_id, price)
+                        title = str(found.get("title") or offer_obj.get("name") or "-")
+                        await message.bot.edit_message_text(
+                            tr.t(lang, "auto_restore_confirm_enable", offer_id=offer_id),
+                            chat_id=message.chat.id,
+                            message_id=last_message_id,
+                            reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+                        )
+                else:
+                    await message.bot.edit_message_text(
+                        tr.t(lang, "auto_restore_offer_not_found", offer_id=offer_id),
+                        chat_id=message.chat.id,
+                        message_id=last_message_id,
+                        reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+                    )
+            else:
+                await message.bot.edit_message_text(
+                    tr.t(lang, "auto_restore_offer_not_found", offer_id=offer_id),
+                    chat_id=message.chat.id,
+                    message_id=last_message_id,
+                    reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+                )
+        except Exception as exc:
+            log.warning("auto_restore_fetch_offer_failed user_id=%s offer_id=%s error=%s", message.from_user.id, offer_id, exc)
+            # Если не смогли найти — сохраняем с нулевыми game_id/category_id, пусть пользователь потом вручную настроит
+            await db.set_auto_restore(offer_id, 0, 0, 0)
+            await message.bot.edit_message_text(
+                tr.t(lang, "auto_restore_confirm_enable", offer_id=offer_id),
+                chat_id=message.chat.id,
+                message_id=last_message_id,
+                reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+            )
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("auto_restore:item:"))
+async def auto_restore_item(callback: CallbackQuery, state: FSMContext):
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(callback.from_user.id)
+    lang = await _lang_of(user, cfg)
+    parts = callback.data.split(":", 2)
+    item_id = parts[2] if len(parts) >= 3 else ""
+    try:
+        offer_id = int(item_id)
+    except ValueError:
+        await auto_restore_list(callback, state)
+        return
+    ar = await db.get_auto_restore(offer_id)
+    if not ar:
+        await auto_restore_list(callback, state)
+        return
+    enabled = True
+    lines = [
+        tr.t(lang, "auto_restore_enabled_for" if enabled else "auto_restore_disabled_for", offer_id=offer_id),
+        f"Game ID: <code>{ar.get('game_id', 0)}</code>",
+        f"Category ID: <code>{ar.get('category_id', 0)}</code>",
+        f"Price: <code>{ar.get('price', 0)}</code>",
+        f"Quantity: <code>{ar.get('quantity', 1)}</code>",
+    ]
+    try:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=kb.auto_restore_item(lambda k: tr.t(lang, k), item_id, enabled).as_markup(),
+        )
+    except Exception as exc:
+        log.warning("auto_restore_item_failed user_id=%s error=%s", callback.from_user.id, exc)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("auto_restore:remove:"))
+async def auto_restore_remove(callback: CallbackQuery, state: FSMContext):
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(callback.from_user.id)
+    lang = await _lang_of(user, cfg)
+    parts = callback.data.split(":", 2)
+    item_id = parts[2] if len(parts) >= 3 else ""
+    try:
+        offer_id = int(item_id)
+    except ValueError:
+        await callback.answer()
+        return
+    await db.remove_auto_restore(offer_id)
+    await callback.message.edit_text(
+        tr.t(lang, "auto_restore_confirm_disable", offer_id=offer_id),
+        reply_markup=kb.auto_restore_menu(lambda k: tr.t(lang, k)).as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "auto_restore:cancel")
+async def auto_restore_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await open_auto_restore(callback, state)
 
 
 @router.callback_query(F.data == "back:main")
